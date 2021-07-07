@@ -19,11 +19,13 @@ import ideal.sylph.annotation.Description;
 import ideal.sylph.annotation.Name;
 import ideal.sylph.annotation.Version;
 import ideal.sylph.etl.PluginConfig;
-import ideal.sylph.etl.Row;
+import ideal.sylph.etl.Record;
+import ideal.sylph.etl.Schema;
 import ideal.sylph.etl.SinkContext;
 import ideal.sylph.etl.api.RealTimeSink;
 import ideal.sylph.plugins.hdfs.factory.HDFSFactorys;
 import ideal.sylph.plugins.hdfs.parquet.HDFSFactory;
+import org.apache.parquet.column.ParquetProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,7 +43,7 @@ public class HdfsSink
     private static final Logger logger = LoggerFactory.getLogger(HdfsSink.class);
     private final HdfsSinkConfig config;
     private final String sinkTable;
-    private final Row.Schema schema;
+    private final Schema schema;
     private int eventTimeIndex = -1;
 
     private HDFSFactory hdfsFactory;
@@ -59,14 +61,14 @@ public class HdfsSink
                 break;
             }
         }
-        checkState(eventTimeIndex != -1, config.eventTimeName + " does not exist,but only " + schema.getFieldNames());
+        checkState(eventTimeIndex != -1, "eventTime_field " + config.eventTimeName + " does not exist,but only " + schema.getFieldNames());
 
         checkState("text".equals(config.format.toLowerCase()) || "parquet".equals(config.format.toLowerCase()),
                 "Hdfs sink format only supports text and parquet");
     }
 
     @Override
-    public void process(Row value)
+    public void process(Record value)
     {
         try {
             long eventTime = value.getAs(eventTimeIndex);
@@ -95,15 +97,18 @@ public class HdfsSink
                 this.hdfsFactory = HDFSFactorys.getTextFileWriter()
                         .tableName(sinkTable)
                         .schema(schema)
-                        .writeTableDir(config.writeDir)
+                        .partition(partitionId)
+                        .config(config)
                         .getOrCreate();
                 break;
 
             case "parquet":
                 this.hdfsFactory = HDFSFactorys.getParquetWriter()
+                        .parquetVersion(ParquetProperties.WriterVersion.PARQUET_2_0)
                         .tableName(sinkTable)
                         .schema(schema)
-                        .writeTableDir(config.writeDir)
+                        .partition(partitionId)
+                        .config(config)
                         .getOrCreate();
                 break;
             default:
@@ -138,5 +143,47 @@ public class HdfsSink
         @Name("eventTime_field")
         @Description("this is your data eventTime_field, 必须是13位时间戳")
         private String eventTimeName;
+
+        @Name("file.split.size")
+        @Description("default:128MB")
+        private long fileSplitSize = 128L;
+
+        @Name("batchBufferSize")
+        @Description("default:5MB")
+        private long batchBufferSize = 5L;
+
+        @Name("maxCloseMinute")
+        @Description("default:30 Minute")
+        private long maxCloseMinute = 30;
+
+        public long getBatchBufferSize()
+        {
+            return this.batchBufferSize;
+        }
+
+        public long getFileSplitSize()
+        {
+            return this.fileSplitSize;
+        }
+
+        public String getEventTimeName()
+        {
+            return this.eventTimeName;
+        }
+
+        public String getFormat()
+        {
+            return this.format;
+        }
+
+        public String getWriteDir()
+        {
+            return this.writeDir;
+        }
+
+        public long getMaxCloseMinute()
+        {
+            return maxCloseMinute;
+        }
     }
 }

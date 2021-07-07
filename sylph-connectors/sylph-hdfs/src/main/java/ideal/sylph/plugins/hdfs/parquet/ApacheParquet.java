@@ -15,7 +15,7 @@
  */
 package ideal.sylph.plugins.hdfs.parquet;
 
-import ideal.sylph.etl.Row;
+import ideal.sylph.etl.Record;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -38,13 +38,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static org.apache.parquet.hadoop.ParquetWriter.DEFAULT_BLOCK_SIZE;
 import static org.apache.parquet.hadoop.ParquetWriter.DEFAULT_IS_DICTIONARY_ENABLED;
@@ -60,9 +58,6 @@ public class ApacheParquet
     private final SimpleGroupFactory groupFactory;
     private final MessageType schema;
     private final String outputPath;
-
-    private final ReadWriteLock rwLock = new ReentrantReadWriteLock();
-    private final Lock lock = rwLock.writeLock();
 
     private long createTime = System.currentTimeMillis();
     private long lastTime = createTime;
@@ -124,18 +119,16 @@ public class ApacheParquet
         return writer.getDataSize();
     }
 
-    /**
-     * 入参list<Object>
-     */
     @Override
-    public void writeLine(List<Object> evalRow)
+    public void writeLine(Collection<Object> evalRow)
     {
         Group group = groupFactory.newGroup();
 
         List<ColumnDescriptor> columns = schema.getColumns();
-        for (int i = 0; i < evalRow.size(); i++) {
-            Object value = evalRow.get(i);
+        int i = 0;
+        for (Object value : evalRow) {
             addValueToGroup(columns.get(i).getType().javaType, group, i, value);
+            i++;
         }
 
         try {
@@ -146,17 +139,14 @@ public class ApacheParquet
         }
     }
 
-    /**
-     * 入参list<Object>
-     */
     @Override
-    public void writeLine(Row row)
+    public void writeLine(Record record)
     {
         Group group = groupFactory.newGroup();
         List<ColumnDescriptor> columns = schema.getColumns();
-        for (int i = 0; i < row.size(); i++) {
-            Object value = row.getAs(i);
-            addValueToGroup(columns.get(i).getType().javaType, group, i++, value);
+        for (int i = 0; i < record.size(); i++) {
+            Object value = record.getAs(i);
+            addValueToGroup(columns.get(i).getType().javaType, group, i, value);
         }
         try {
             writeGroup(group);
@@ -210,14 +200,8 @@ public class ApacheParquet
         if (group == null) {
             return;
         }
-        try {
-            lock.lock();  //加锁
-            lastTime = System.currentTimeMillis();
-            writer.write(group);
-        }
-        finally {
-            lock.unlock(); //解锁
-        }
+        lastTime = System.currentTimeMillis();
+        writer.write(group);
     }
 
     /**
@@ -228,7 +212,6 @@ public class ApacheParquet
             throws IOException
     {
         try {
-            lock.lock();
             writer.close();
             //1,修改文件名称
             FileSystem hdfs = FileSystem.get(java.net.URI.create(outputPath), new Configuration());
@@ -240,9 +223,6 @@ public class ApacheParquet
             logger.error("关闭Parquet输出流异常", e);
             FileSystem hdfs = FileSystem.get(java.net.URI.create(outputPath), new Configuration());
             hdfs.rename(new Path(outputPath), new Path(outputPath + ".err"));
-        }
-        finally {
-            lock.unlock();
         }
     }
 
@@ -310,7 +290,7 @@ public class ApacheParquet
         }
     }
 
-    public static Builder builder()
+    public static Builder create()
     {
         return new Builder();
     }
@@ -339,7 +319,7 @@ public class ApacheParquet
             return this;
         }
 
-        public ApacheParquet build()
+        public ApacheParquet get()
                 throws IOException
         {
             return new ApacheParquet(writePath, schema, parquetVersion);

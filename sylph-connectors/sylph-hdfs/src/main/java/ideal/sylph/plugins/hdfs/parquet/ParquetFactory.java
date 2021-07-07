@@ -16,7 +16,7 @@
 package ideal.sylph.plugins.hdfs.parquet;
 
 import com.google.common.collect.ImmutableList;
-import ideal.sylph.etl.Row;
+import ideal.sylph.etl.Record;
 import ideal.sylph.plugins.hdfs.factory.HDFSFactorys;
 import ideal.sylph.plugins.hdfs.factory.TimeParser;
 import ideal.sylph.plugins.hdfs.utils.CommonUtil;
@@ -28,6 +28,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -103,21 +104,27 @@ public class ParquetFactory
          * */
         final Callable<Void> consumer = () -> {
             Thread.currentThread().setName("Parquet_Factory_Consumer");
-            while (!closed) {
-                Runnable value = streamData.poll();
-                //事件1
-                if (value != null) {
-                    value.run(); //put data line
+            try {
+                while (!closed) {
+                    Runnable value = streamData.poll();
+                    //事件1
+                    if (value != null) {
+                        value.run(); //put data line
+                    }
+                    //事件2 读取指示序列
+                    Runnable event = monitorEvent.poll();
+                    if (event != null) {
+                        event.run();
+                    }
+                    //事件3
+                    if (value == null && event == null) {
+                        TimeUnit.MILLISECONDS.sleep(1);
+                    }
                 }
-                //事件2 读取指示序列
-                Runnable event = monitorEvent.poll();
-                if (event != null) {
-                    event.run();
-                }
-                //事件3
-                if (value == null && event == null) {
-                    TimeUnit.MILLISECONDS.sleep(1);
-                }
+            }
+            catch (Exception e) {
+                logger.error("Parquet_Factory_Consumer error", e);
+                System.exit(-1);
             }
             return null;
         };
@@ -242,7 +249,7 @@ public class ParquetFactory
     }
 
     @Override
-    public void writeLine(long eventTime, List<Object> evalRow)
+    public void writeLine(long eventTime, Collection<Object> evalRow)
     {
         try {
             streamData.put(() -> {
@@ -256,12 +263,12 @@ public class ParquetFactory
     }
 
     @Override
-    public void writeLine(long eventTime, Row evalRow)
+    public void writeLine(long eventTime, Record evalRecord)
     {
         try {
             streamData.put(() -> {
                 ApacheParquet parquet = getParquetWriter(eventTime);
-                parquet.writeLine(evalRow);
+                parquet.writeLine(evalRecord);
             });
         }
         catch (InterruptedException e) {
@@ -304,16 +311,16 @@ public class ParquetFactory
     private ApacheParquet getParquetWriter(long eventTime)
     {
         TimeParser timeParser = new TimeParser(eventTime);
-        String parquetPath = writeTableDir + timeParser.getPartionPath();
+        String parquetPath = writeTableDir + timeParser.getPartitionPath();
 
         String rowKey = HDFSFactorys.getRowKey(table, timeParser);
         return getParquetWriter(rowKey, () -> {
             try {
-                return ApacheParquet.builder()
+                return ApacheParquet.create()
                         .parquetVersion(parquetVersion)
                         .schema(schema)
                         .writePath(parquetPath)
-                        .build();
+                        .get();
             }
             catch (IOException e) {
                 throw new RuntimeException("parquet writer create failed", e);

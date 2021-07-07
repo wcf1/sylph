@@ -1,0 +1,15 @@
+*.sw*
+.DS_Store
+node_modules
+npm-debug.log*
+
+.idea
+.gradle
+**/build/
+!src/**/build/
+**/out/
+!src/**/out/
+
+*.jar
+*.class
+*.log

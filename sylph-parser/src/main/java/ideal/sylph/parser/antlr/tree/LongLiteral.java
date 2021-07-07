@@ -29,7 +29,7 @@ public class LongLiteral
 
     public LongLiteral(NodeLocation location, String value)
     {
-        this(Optional.of(location), value);
+        this(Optional.ofNullable(location), value);
     }
 
     private LongLiteral(Optional<NodeLocation> location, String value)

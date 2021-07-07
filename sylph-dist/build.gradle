@@ -11,8 +11,6 @@ task copyFiles(type: Copy, dependsOn: copyLibs) {
   into project.buildDir
 }
 
-assemble.dependsOn copyFiles
-
 task dist(type: Tar) {
   baseName = rootProject.getName()
   classifier = 'bin'
@@ -32,6 +30,10 @@ task dist(type: Tar) {
     into(tarpath + "/etc")
   }
 
+  from(project.files('src/data')) {
+    into(tarpath + "/data")
+  }
+
   from(project.files('src/jobs')) {
     into(tarpath + "/jobs")
   }
@@ -44,11 +46,16 @@ task dist(type: Tar) {
     into tarpath + "/modules"
   }
 
-  from(project.files('build/etl-plugins')) {
-    into(tarpath + "/etl-plugins")
+  from(project.files('build/plugins')) {
+    into(tarpath + "/plugins")
   }
 }
+dist.dependsOn copyFiles
 
-artifacts {
-  'default' dist
-}
+
+//artifacts {
+//  'default' dist
+//}
+
+tasks.findByName("uploadArchives").setEnabled(false)
+//tasks.remove(tasks.findByName("uploadArchives"))

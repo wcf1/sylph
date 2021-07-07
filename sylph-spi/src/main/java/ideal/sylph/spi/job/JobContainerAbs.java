@@ -15,32 +15,64 @@
  */
 package ideal.sylph.spi.job;
 
-import javax.validation.constraints.NotNull;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import static ideal.sylph.spi.job.Job.Status.RUNNING;
-import static ideal.sylph.spi.job.Job.Status.STOP;
-import static java.util.Objects.requireNonNull;
+import java.util.Optional;
+
+import static ideal.sylph.spi.job.JobContainer.Status.RUNNING;
+import static ideal.sylph.spi.job.JobContainer.Status.STARTED_ERROR;
+import static ideal.sylph.spi.job.JobContainer.Status.STOP;
 
 public abstract class JobContainerAbs
         implements JobContainer
 {
-    private volatile Job.Status status = STOP;
+    private static final Logger logger = LoggerFactory.getLogger(JobContainer.class);
+    private int countReStart;
+    private long lastStartTime;
+    private volatile Status status = STOP;
 
-    @Override
-    public synchronized void setStatus(Job.Status status)
+    public int getCountReStart()
     {
-        this.status = requireNonNull(status, "status is null");
+        return countReStart;
     }
 
-    @NotNull
-    @Override
-    public synchronized Job.Status getStatus()
+    public long getLastStartTime()
     {
-        if (status == RUNNING) {
-            return isRunning() ? RUNNING : STOP;
+        return lastStartTime;
+    }
+
+    protected abstract String deploy()
+            throws Exception;
+
+    @Override
+    public final Optional<String> run()
+            throws Exception
+    {
+        this.countReStart++;
+        long startTime = System.currentTimeMillis();
+        if ((startTime - getLastStartTime()) < 300_000) {
+            logger.warn("STARTED_ERROR, Job restarts in a short time");
+            this.setStatus(STARTED_ERROR);
+            return Optional.empty();
         }
+        else {
+            this.lastStartTime = startTime;
+            String runId = deploy();
+            this.setStatus(RUNNING);
+            return Optional.of(runId);
+        }
+    }
+
+    @Override
+    public void setStatus(Status status)
+    {
+        this.status = status;
+    }
+
+    @Override
+    public Status getStatus()
+    {
         return status;
     }
-
-    public abstract boolean isRunning();
 }

@@ -1,14 +1,16 @@
 subprojects {
+
   apply plugin: 'com.github.harbby.gradle.serviceloader'
   serviceLoader {
     serviceInterface 'ideal.sylph.spi.Runner'
-    serviceInterface 'ideal.sylph.etl.PipelinePlugin'
+    serviceInterface 'ideal.sylph.etl.Operator'
   }
 
   dependencies {
-    compileOnly(project(':sylph-spi'))
+    compile(project(":sylph-api"))
 
-    compile(project(":sylph-etl-api"))
+    compileOnly group: 'org.apache.hadoop', name: 'hadoop-client', version: deps.hadoop
+    //compileOnly 'org.apache.flink:flink-shaded-hadoop-2-uber:2.8.3-10.0'
   }
 
   def modules = project(':sylph-dist').buildDir.path + "/modules/${name}"

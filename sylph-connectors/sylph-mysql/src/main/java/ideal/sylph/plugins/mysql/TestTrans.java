@@ -16,20 +16,21 @@
 package ideal.sylph.plugins.mysql;
 
 import ideal.sylph.etl.Collector;
-import ideal.sylph.etl.Row;
+import ideal.sylph.etl.Record;
+import ideal.sylph.etl.Schema;
 import ideal.sylph.etl.api.RealTimeTransForm;
 
 public class TestTrans
         implements RealTimeTransForm
 {
     @Override
-    public void process(Row input, Collector<Row> collector)
+    public void process(Record input, Collector<Record> collector)
     {
         collector.collect(input);
     }
 
     @Override
-    public Row.Schema getSchema()
+    public Schema getSchema()
     {
         return null;
     }

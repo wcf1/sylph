@@ -16,8 +16,7 @@
 package ideal.sylph.spi;
 
 import com.github.harbby.gadtry.graph.Graph;
-import com.github.harbby.gadtry.graph.GraphBuilder;
-import com.github.harbby.gadtry.graph.impl.DagNode;
+import com.github.harbby.gadtry.graph.impl.NodeOperator;
 import ideal.sylph.spi.job.EtlFlow;
 import ideal.sylph.spi.model.EdgeInfo;
 import ideal.sylph.spi.model.NodeInfo;
@@ -29,9 +28,9 @@ public class GraphAppUtil
 {
     private GraphAppUtil() {}
 
-    public static <R> Graph<R> buildGraph(final NodeLoader<R> loader, String jobId, EtlFlow flow)
+    public static <R> void buildGraph(final NodeLoader<R> loader, EtlFlow flow)
     {
-        final GraphBuilder<R> graphx = Graph.<R>builder().name(jobId);
+        final Graph.GraphBuilder<NodeOperator<R>, Void> graphBuilder = Graph.builder();
         final List<NodeInfo> nodes = flow.getNodes();
         final List<EdgeInfo> edges = flow.getEdges();
 
@@ -42,25 +41,26 @@ public class GraphAppUtil
 
             switch (nodeInfo.getNodeType()) {
                 case "source":
-                    graphx.addNode(new DagNode<>(id, driverString, loader.loadSource(driverString, config)));
+                    graphBuilder.addNode(id, new NodeOperator<>(loader.loadSource(driverString, config)));
                     break;
                 case "transform":
-                    graphx.addNode(new DagNode<>(id, driverString, loader.loadTransform(driverString, config)));
+                    graphBuilder.addNode(id, new NodeOperator<>(loader.loadTransform(driverString, config)));
                     break;
                 case "sink":
-                    graphx.addNode(new DagNode<>(id, driverString, loader.loadSink(driverString, config)));
+                    graphBuilder.addNode(id, new NodeOperator<>(loader.loadSink(driverString, config)));
                     break;
                 default:
-                    System.out.println("错误的类型算子 + " + nodeInfo);
+                    throw new IllegalArgumentException("Unknown type: " + nodeInfo);
             }
         });
 
-        //TODO:  .split("-")[0] 目前是为了兼容yaml中的冗余信息
-        edges.forEach(edgeInfo -> graphx.addEdge(
+        edges.forEach(edgeInfo -> graphBuilder.addEdge(
                 edgeInfo.getInNodeId().split("-")[0],
                 edgeInfo.getOutNodeId().split("-")[0]
         ));
 
-        return graphx.build();
+        Graph<NodeOperator<R>, Void> graph = graphBuilder.create();
+        graph.printShow().forEach(System.out::println);
+        NodeOperator.runGraph(graph);
     }
 }

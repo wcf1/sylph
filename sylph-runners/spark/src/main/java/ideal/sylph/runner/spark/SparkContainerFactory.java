@@ -15,25 +15,24 @@
  */
 package ideal.sylph.runner.spark;
 
-import com.github.harbby.gadtry.base.Lazys;
 import com.github.harbby.gadtry.ioc.IocFactory;
+import com.github.harbby.gadtry.jvm.JVMLauncher;
 import com.github.harbby.gadtry.jvm.JVMLaunchers;
+import com.github.harbby.gadtry.jvm.VmFuture;
 import ideal.sylph.runner.spark.yarn.SparkAppLauncher;
 import ideal.sylph.runtime.local.LocalContainer;
 import ideal.sylph.runtime.yarn.YarnJobContainer;
-import ideal.sylph.runtime.yarn.YarnJobContainerProxy;
 import ideal.sylph.runtime.yarn.YarnModule;
-import ideal.sylph.spi.App;
 import ideal.sylph.spi.job.ContainerFactory;
 import ideal.sylph.spi.job.Job;
 import ideal.sylph.spi.job.JobContainer;
-import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.spark.SparkConf;
 import org.apache.spark.SparkContext;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.streaming.StreamingContext;
 
-import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 import static com.google.common.base.Preconditions.checkArgument;
@@ -42,43 +41,61 @@ import static java.util.Objects.requireNonNull;
 public class SparkContainerFactory
         implements ContainerFactory
 {
-    private final Supplier<SparkAppLauncher> yarnLauncher = Lazys.goLazy(() -> {
-        IocFactory injector = IocFactory.create(new YarnModule());
-        return injector.getInstance(SparkAppLauncher.class);
+    private final IocFactory injector = IocFactory.create(new YarnModule(), binder -> {
+        binder.bind(SparkAppLauncher.class).by(SparkAppLauncher.class).withSingle();
     });
 
     @Override
-    public JobContainer getYarnContainer(Job job, String lastRunid)
+    public JobContainer createYarnContainer(Job job, String lastRunid)
     {
-        SparkAppLauncher appLauncher = yarnLauncher.get();
-        final JobContainer yarnJobContainer = new YarnJobContainer(appLauncher.getYarnClient(), lastRunid)
-        {
-            @Override
-            public Optional<String> run()
-                    throws Exception
-            {
-                this.setYarnAppId(null);
-                ApplicationId yarnAppId = appLauncher.run(job);
-                this.setYarnAppId(yarnAppId);
-                return Optional.of(yarnAppId.toString());
-            }
-        };
+        SparkAppLauncher appLauncher = injector.getInstance(SparkAppLauncher.class);
         //----create JobContainer Proxy
-        return YarnJobContainerProxy.get(yarnJobContainer);
+        return YarnJobContainer.builder()
+                .setYarnClient(appLauncher.getYarnClient())
+                .setSubmitter(() -> appLauncher.run(job))
+                .setJobClassLoader(job.getJobClassLoader())
+                .setLastRunId(lastRunid)
+                .build();
     }
 
     @Override
-    public JobContainer getLocalContainer(Job job, String lastRunid)
+    public JobContainer createLocalContainer(Job job, String lastRunid)
     {
-        SparkJobHandle<App<?>> jobHandle = (SparkJobHandle) job.getJobHandle();
+        AtomicReference<String> url = new AtomicReference<>();
+        JVMLauncher<Boolean> launcher = JVMLaunchers.<Boolean>newJvm()
+//                .setXms("512m")
+                .setXmx("512m")
+                .setConsole(line -> {
+                    String logo = "Bound SparkUI to 0.0.0.0, and started at";
+                    if (url.get() == null && line.contains(logo)) {
+                        url.set(line.split(logo)[1].trim());
+                    }
+                    System.out.println(line);
+                })
+                .notDepThisJvmClassPath()
+                .addUserjars(job.getDepends())
+                .build();
 
-        JVMLaunchers.VmBuilder<Boolean> vmBuilder = JVMLaunchers.<Boolean>newJvm()
-                .setCallable(() -> {
+        return new LocalContainer()
+        {
+            @Override
+            public String getJobUrl()
+            {
+                return url.get();
+            }
+
+            @Override
+            public VmFuture startAsyncExecutor()
+                    throws Exception
+            {
+                Supplier<?> jobDAG = job.getJobDAG();
+                url.set(null);
+                return launcher.startAsync(() -> {
                     SparkConf sparkConf = new SparkConf().setMaster("local[*]").setAppName("spark_local");
                     SparkContext sparkContext = new SparkContext(sparkConf);
-                    App<?> app = requireNonNull(jobHandle, "sparkJobHandle is null").getApp().get();
-                    app.build();
-                    Object appContext = app.getContext();
+
+                    Object appContext = requireNonNull(jobDAG.get(), "sparkJobHandle is null");
+                    sparkContext.setLogLevel("WARN");
                     if (appContext instanceof SparkSession) {
                         SparkSession sparkSession = (SparkSession) appContext;
                         checkArgument(sparkSession.streams().active().length > 0, "no stream pipeline");
@@ -89,20 +106,14 @@ public class SparkContainerFactory
                         ssc.start();
                         ssc.awaitTermination();
                     }
+                    else {
+                        throw new IllegalAccessException();
+                    }
+                    System.out.println("sleep........");
+                    TimeUnit.SECONDS.sleep(99999);
                     return true;
-                })
-                .setXms("512m")
-                .setXmx("512m")
-                .setConsole(System.out::println)
-                .notDepThisJvmClassPath()
-                .addUserjars(job.getDepends());
-
-        return new LocalContainer(vmBuilder);
-    }
-
-    @Override
-    public JobContainer getK8sContainer(Job job, String lastRunid)
-    {
-        throw new UnsupportedOperationException("this method have't support!");
+                });
+            }
+        };
     }
 }

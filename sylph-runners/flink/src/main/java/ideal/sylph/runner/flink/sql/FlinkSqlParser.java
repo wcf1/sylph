@@ -16,7 +16,7 @@
 package ideal.sylph.runner.flink.sql;
 
 import com.github.harbby.gadtry.ioc.IocFactory;
-import ideal.sylph.etl.PipelinePlugin;
+import ideal.sylph.etl.Operator;
 import ideal.sylph.etl.api.RealTimeTransForm;
 import ideal.sylph.etl.join.JoinContext;
 import ideal.sylph.etl.join.SelectField;
@@ -24,9 +24,9 @@ import ideal.sylph.parser.antlr.tree.CreateTable;
 import ideal.sylph.parser.calcite.CalciteSqlParser;
 import ideal.sylph.parser.calcite.JoinInfo;
 import ideal.sylph.parser.calcite.TableName;
-import ideal.sylph.runner.flink.actuator.StreamSqlUtil;
+import ideal.sylph.runner.flink.engines.StreamSqlUtil;
+import ideal.sylph.spi.ConnectorStore;
 import ideal.sylph.spi.NodeLoader;
-import ideal.sylph.spi.model.PipelinePluginManager;
 import org.apache.calcite.config.Lex;
 import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlIdentifier;
@@ -45,8 +45,7 @@ import org.apache.flink.calcite.shaded.com.google.common.collect.ImmutableList;
 import org.apache.flink.shaded.guava18.com.google.common.collect.ImmutableMap;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.table.api.Table;
-import org.apache.flink.table.api.TableException;
-import org.apache.flink.table.api.java.StreamTableEnvironment;
+import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.types.Row;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -57,6 +56,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import static com.github.harbby.gadtry.base.Throwables.throwsException;
 import static com.google.common.base.Preconditions.checkState;
 import static java.util.Objects.requireNonNull;
 import static org.apache.calcite.sql.SqlKind.AS;
@@ -75,7 +75,7 @@ public class FlinkSqlParser
      * Fully consistent with the flink sql syntax
      * <p>
      * Returns the SQL parser config for this environment including a custom Calcite configuration.
-     * see {@link org.apache.flink.table.api.TableEnvironment#getSqlParserConfig}
+     * see {@link org.apache.flink.table.planner.PlanningConfigurationBuilder#getSqlParserConfig}
      * <p>
      * we use Java lex because back ticks are easier than double quotes in programming
      * and cases are preserved
@@ -86,7 +86,7 @@ public class FlinkSqlParser
             .build();
 
     private StreamTableEnvironment tableEnv;
-    private PipelinePluginManager pluginManager;
+    private ConnectorStore connectorStore;
 
     public static Builder builder()
     {
@@ -105,9 +105,9 @@ public class FlinkSqlParser
             return Builder.this;
         }
 
-        public Builder setBatchPluginManager(PipelinePluginManager pluginManager)
+        public Builder setConnectorStore(ConnectorStore connectorStore)
         {
-            sqlParser.pluginManager = pluginManager;
+            sqlParser.connectorStore = connectorStore;
             return Builder.this;
         }
 
@@ -121,12 +121,12 @@ public class FlinkSqlParser
         {
             checkState(sqlParser.sqlParserConfig != null);
             checkState(sqlParser.tableEnv != null);
-            checkState(sqlParser.pluginManager != null);
+            checkState(sqlParser.connectorStore != null);
             return sqlParser;
         }
     }
 
-    public void parser(String query, List<CreateTable> batchTablesList)
+    public Table parser(String query, List<CreateTable> batchTablesList)
     {
         Map<String, CreateTable> batchTables = batchTablesList.stream()
                 .collect(Collectors.toMap(CreateTable::getName, v -> v));
@@ -137,19 +137,19 @@ public class FlinkSqlParser
             plan = sqlParser.getPlan(query, sqlParserConfig);
         }
         catch (SqlParseException e) {
-            throw new RuntimeException(query, e);
+            throw throwsException(e);
         }
 
         List<String> registerViews = new ArrayList<>();
         try {
-            translate(plan, batchTables, registerViews);
+            return translate(plan, batchTables, registerViews);
         }
         finally {
             //registerViews.forEach(tableName -> tableEnv.sqlQuery("drop table " + tableName));
         }
     }
 
-    private void translate(List<Object> execNodes, Map<String, CreateTable> batchTables, List<String> registerViews)
+    private Table translate(List<Object> execNodes, Map<String, CreateTable> batchTables, List<String> registerViews)
     {
         for (Object it : execNodes) {
             if (it instanceof SqlNode) {
@@ -169,13 +169,7 @@ public class FlinkSqlParser
                 else if (sqlKind == SELECT) {
                     logger.warn("You entered the select query statement, only one for testing");
                     String sql = sqlNode.toString();
-                    Table table = tableEnv.sqlQuery(sql);
-                    try {
-                        tableEnv.toAppendStream(table, Row.class).print();
-                    }
-                    catch (TableException e) {
-                        tableEnv.toRetractStream(table, Row.class).print();
-                    }
+                    return tableEnv.sqlQuery(sql);
                 }
                 else if (sqlKind == WITH_ITEM) {
                     SqlWithItem sqlWithItem = (SqlWithItem) sqlNode;
@@ -192,6 +186,7 @@ public class FlinkSqlParser
                 throw new IllegalArgumentException(it.toString());
             }
         }
+        return null;
     }
 
     private void translateJoin(JoinInfo joinInfo, Map<String, CreateTable> batchTables)
@@ -203,7 +198,7 @@ public class FlinkSqlParser
 
         //get batch table schema
         CreateTable batchTable = requireNonNull(batchTables.get(joinInfo.getBatchTable().getName()), "batch table [" + joinInfo.getJoinTableName() + "] not exits");
-        RowTypeInfo batchTableRowType = StreamSqlUtil.getTableRowTypeInfo(batchTable);
+        RowTypeInfo batchTableRowType = StreamSqlUtil.schemaToRowTypeInfo(StreamSqlUtil.getTableSchema(batchTable));
         List<SelectField> joinSelectFields = getAllSelectFields(joinInfo, streamRowType, batchTableRowType);
 
         //It is recommended to do keyby first.
@@ -215,8 +210,8 @@ public class FlinkSqlParser
         RowTypeInfo rowTypeInfo = getJoinOutScheam(joinSelectFields);
         joinResultStream.getTransformation().setOutputType(rowTypeInfo);
         //--register tmp joinTable
+        tableEnv.dropTemporaryView(joinInfo.getJoinTableName());
         tableEnv.registerDataStream(joinInfo.getJoinTableName(), joinResultStream);
-
         //next update join select query
         joinQueryUpdate(joinInfo, rowTypeInfo.getFieldNames());
     }
@@ -225,13 +220,7 @@ public class FlinkSqlParser
     {
         Map<String, Object> withConfig = batchTable.getWithConfig();
         String driverOrName = (String) withConfig.get("type");
-        Class<?> driver = null;
-        try {
-            driver = pluginManager.loadPluginDriver(driverOrName, PipelinePlugin.PipelineType.transform);
-        }
-        catch (ClassNotFoundException e) {
-            throw new RuntimeException(e);
-        }
+        Class<?> driver = connectorStore.getConnectorDriver(driverOrName, Operator.PipelineType.transform);
         checkState(RealTimeTransForm.class.isAssignableFrom(driver), "batch table type driver must is RealTimeTransForm");
 
         // instance

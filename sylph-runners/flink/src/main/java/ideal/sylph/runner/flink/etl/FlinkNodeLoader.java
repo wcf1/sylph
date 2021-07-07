@@ -15,20 +15,24 @@
  */
 package ideal.sylph.runner.flink.etl;
 
-import com.github.harbby.gadtry.base.JavaType;
+import com.github.harbby.gadtry.base.JavaTypes;
 import com.github.harbby.gadtry.ioc.IocFactory;
-import ideal.sylph.etl.PipelinePlugin;
+import ideal.sylph.etl.Operator;
+import ideal.sylph.etl.Schema;
 import ideal.sylph.etl.api.RealTimeSink;
 import ideal.sylph.etl.api.RealTimeTransForm;
 import ideal.sylph.etl.api.Sink;
 import ideal.sylph.etl.api.Source;
 import ideal.sylph.etl.api.TransForm;
+import ideal.sylph.spi.ConnectorStore;
 import ideal.sylph.spi.NodeLoader;
 import ideal.sylph.spi.exception.SylphException;
-import ideal.sylph.spi.model.PipelinePluginManager;
+import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.DataStreamSink;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.types.Row;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,6 +40,7 @@ import org.slf4j.LoggerFactory;
 import java.lang.reflect.Type;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 
 import static com.google.common.base.Preconditions.checkState;
@@ -46,40 +51,35 @@ public final class FlinkNodeLoader
         implements NodeLoader<DataStream<Row>>
 {
     private static final Logger logger = LoggerFactory.getLogger(FlinkNodeLoader.class);
-    private final PipelinePluginManager pluginManager;
+    private final ConnectorStore connectorStore;
     private final IocFactory iocFactory;
 
-    public FlinkNodeLoader(PipelinePluginManager pluginManager, IocFactory iocFactory)
+    public FlinkNodeLoader(ConnectorStore connectorStore, IocFactory iocFactory)
     {
-        this.pluginManager = requireNonNull(pluginManager, "binds is null");
+        this.connectorStore = requireNonNull(connectorStore, "binds is null");
         this.iocFactory = requireNonNull(iocFactory, "iocFactory is null");
     }
 
     @Override
     public UnaryOperator<DataStream<Row>> loadSource(String driverStr, final Map<String, Object> config)
     {
-        try {
-            final Class<?> driverClass = pluginManager.loadPluginDriver(driverStr, PipelinePlugin.PipelineType.source);
-            checkState(Source.class.isAssignableFrom(driverClass),
-                    "driverStr must is RealTimeSink.class or Sink.class");
-            checkDataStreamRow(Source.class, driverClass);
+        final Class<?> driverClass = connectorStore.getConnectorDriver(driverStr, Operator.PipelineType.source);
+        checkState(Source.class.isAssignableFrom(driverClass),
+                "The Source driver must is Source.class, But your " + driverClass);
+        checkDataStreamRow(Source.class, driverClass);
 
-            @SuppressWarnings("unchecked") final Source<DataStream<Row>> source = (Source<DataStream<Row>>) getPluginInstance(driverClass, config);
+        @SuppressWarnings("unchecked") final Source<DataStream<Row>> source = (Source<DataStream<Row>>) getPluginInstance(driverClass, config);
 
-            return (stream) -> {
-                logger.info("source {} schema:{}", driverClass, source.getSource().getType());
-                return source.getSource();
-            };
-        }
-        catch (ClassNotFoundException e) {
-            throw new SylphException(JOB_BUILD_ERROR, e);
-        }
+        return (stream) -> {
+            logger.info("source {} schema:{}", driverClass, source.getSource().getType());
+            return source.getSource();
+        };
     }
 
     private static void checkDataStreamRow(Class<?> pluginInterface, Class<?> driverClass)
     {
-        Type streamRow = JavaType.make(DataStream.class, new Type[] {Row.class}, null);
-        Type checkType = JavaType.make(pluginInterface, new Type[] {streamRow}, null);
+        Type streamRow = JavaTypes.make(DataStream.class, new Type[] {Row.class}, null);
+        Type checkType = JavaTypes.make(pluginInterface, new Type[] {streamRow}, null);
 
         for (Type type : driverClass.getGenericInterfaces()) {
             if (checkType.equals(type)) {
@@ -93,20 +93,13 @@ public final class FlinkNodeLoader
     @Override
     public UnaryOperator<DataStream<Row>> loadSink(String driverStr, final Map<String, Object> config)
     {
-        final Object driver;
-        try {
-            Class<?> driverClass = pluginManager.loadPluginDriver(driverStr, PipelinePlugin.PipelineType.sink);
-            checkState(RealTimeSink.class.isAssignableFrom(driverClass) || Sink.class.isAssignableFrom(driverClass),
-                    "driverStr must is RealTimeSink.class or Sink.class");
-            if (Sink.class.isAssignableFrom(driverClass)) {
-                checkDataStreamRow(Sink.class, driverClass);
-            }
-
-            driver = getPluginInstance(driverClass, config);
+        Class<?> driverClass = connectorStore.getConnectorDriver(driverStr, Operator.PipelineType.sink);
+        checkState(RealTimeSink.class.isAssignableFrom(driverClass) || Sink.class.isAssignableFrom(driverClass),
+                "The Sink driver must is RealTimeSink.class or Sink.class, But your " + driverClass);
+        if (Sink.class.isAssignableFrom(driverClass)) {
+            checkDataStreamRow(Sink.class, driverClass);
         }
-        catch (ClassNotFoundException e) {
-            throw new SylphException(JOB_BUILD_ERROR, e);
-        }
+        final Object driver = getPluginInstance(driverClass, config);
 
         final Sink<DataStream<Row>> sink;
         if (driver instanceof RealTimeSink) {
@@ -121,9 +114,28 @@ public final class FlinkNodeLoader
 
         return (stream) -> {
             requireNonNull(stream, "Sink find input stream is null");
-            sink.run(stream);
-            return null;
+            DataStreamSink<?> dataStreamSink = sink.addSink(stream);
+            return new DataStreamSinkSupplier(stream.getExecutionEnvironment(), stream.getTransformation(), dataStreamSink);
         };
+    }
+
+    private class DataStreamSinkSupplier
+            extends DataStream<Row>
+            implements Supplier<DataStreamSink<?>>
+    {
+        private final DataStreamSink<?> dataStreamSink;
+
+        public DataStreamSinkSupplier(StreamExecutionEnvironment environment, Transformation<Row> transformation, DataStreamSink<?> dataStreamSink)
+        {
+            super(environment, transformation);
+            this.dataStreamSink = dataStreamSink;
+        }
+
+        @Override
+        public DataStreamSink<?> get()
+        {
+            return dataStreamSink;
+        }
     }
 
     @Override
@@ -139,19 +151,13 @@ public final class FlinkNodeLoader
     @Override
     public final UnaryOperator<DataStream<Row>> loadTransform(String driverStr, final Map<String, Object> config)
     {
-        final Object driver;
-        try {
-            Class<?> driverClass = pluginManager.loadPluginDriver(driverStr, PipelinePlugin.PipelineType.transform);
-            checkState(RealTimeTransForm.class.isAssignableFrom(driverClass) || TransForm.class.isAssignableFrom(driverClass),
-                    "driverStr must is RealTimeSink.class or Sink.class");
-            if (TransForm.class.isAssignableFrom(driverClass)) {
-                checkDataStreamRow(TransForm.class, driverClass);
-            }
-            driver = getPluginInstance(driverClass, config);
+        Class<?> driverClass = connectorStore.getConnectorDriver(driverStr, Operator.PipelineType.transform);
+        checkState(RealTimeTransForm.class.isAssignableFrom(driverClass) || TransForm.class.isAssignableFrom(driverClass),
+                "driverStr must is RealTimeSink.class or Sink.class");
+        if (TransForm.class.isAssignableFrom(driverClass)) {
+            checkDataStreamRow(TransForm.class, driverClass);
         }
-        catch (ClassNotFoundException e) {
-            throw new SylphException(JOB_BUILD_ERROR, e);
-        }
+        final Object driver = getPluginInstance(driverClass, config);
 
         final TransForm<DataStream<Row>> transform;
         if (driver instanceof RealTimeTransForm) {
@@ -167,7 +173,7 @@ public final class FlinkNodeLoader
         return (stream) -> {
             requireNonNull(stream, "Transform find input stream is null");
             DataStream<Row> dataStream = transform.transform(stream);
-            logger.info("transfrom {} schema to:", driver, dataStream.getType());
+            logger.info("transform {} schema to: {}", driver, dataStream.getType());
             return dataStream;
         };
     }
@@ -175,7 +181,21 @@ public final class FlinkNodeLoader
     private static Sink<DataStream<Row>> loadRealTimeSink(RealTimeSink realTimeSink)
     {
         // or user stream.addSink(new FlinkSink(realTimeSink, stream.getType()));
-        return (Sink<DataStream<Row>>) stream -> stream.addSink(new FlinkSink(realTimeSink, stream.getType()));
+        //return (Sink<DataStream<Row>>) stream -> stream.addSink(new FlinkSink(realTimeSink, stream.getType())).name(realTimeSink.getClass().getName());
+        return new Sink<DataStream<Row>>()
+        {
+            @Override
+            public void run(DataStream<Row> stream)
+            {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public <S> S addSink(DataStream<Row> stream)
+            {
+                return (S) stream.addSink(new FlinkSink(realTimeSink, stream.getType())).name(realTimeSink.getClass().getName());
+            }
+        };
     }
 
     private static TransForm<DataStream<Row>> loadRealTimeTransForm(RealTimeTransForm realTimeTransForm)
@@ -184,9 +204,9 @@ public final class FlinkNodeLoader
             final SingleOutputStreamOperator<Row> tmp = stream
                     .flatMap(new FlinkTransFrom(realTimeTransForm, stream.getType()));
             // schema必须要在driver上面指定
-            ideal.sylph.etl.Row.Schema schema = realTimeTransForm.getSchema();
+            Schema schema = realTimeTransForm.getSchema();
             if (schema != null) {
-                RowTypeInfo outPutStreamType = FlinkRow.parserRowType(schema);
+                RowTypeInfo outPutStreamType = FlinkRecord.parserRowType(schema);
                 return tmp.returns(outPutStreamType);
             }
             return tmp;

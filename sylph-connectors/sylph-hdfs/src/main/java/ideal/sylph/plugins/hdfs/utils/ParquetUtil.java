@@ -15,7 +15,7 @@
  */
 package ideal.sylph.plugins.hdfs.utils;
 
-import ideal.sylph.etl.Row;
+import ideal.sylph.etl.Field;
 
 import java.util.List;
 
@@ -29,13 +29,13 @@ public class ParquetUtil
      * @param fields 实际写入Parquet的字段集合
      * @return String 返回字符串
      */
-    public static String buildSchema(List<Row.Field> fields)
+    public static String buildSchema(List<Field> fields)
     {
         StringBuilder sb = new StringBuilder("message row { ");
 
-        for (Row.Field field : fields) {
+        for (Field field : fields) {
             String fieldName = field.getName();
-            Class<?> type = field.getJavaType();
+            Class<?> type = field.getJavaTypeClass();
             switch (type.getSimpleName()) {
                 case "String":
                     sb.append("optional binary ").append(fieldName).append(" (UTF8); ");
@@ -65,8 +65,7 @@ public class ParquetUtil
                 case "Map":
                     throw new UnsupportedOperationException("this type[Map] have't support!");
                 default:
-                    sb.append("optional binary ").append(fieldName).append(" (UTF8); ");
-                    break;
+                    throw new UnsupportedOperationException("this " + type + " have't support!");
             }
         }
         sb.append("} ");

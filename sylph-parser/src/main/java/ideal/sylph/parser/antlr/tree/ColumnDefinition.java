@@ -15,13 +15,13 @@
  */
 package ideal.sylph.parser.antlr.tree;
 
-import com.google.common.collect.ImmutableList;
+import com.github.harbby.gadtry.collection.mutable.MutableList;
 
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
-import static com.google.common.base.MoreObjects.toStringHelper;
+import static com.github.harbby.gadtry.base.MoreObjects.toStringHelper;
 import static java.util.Objects.requireNonNull;
 
 public final class ColumnDefinition
@@ -30,17 +30,19 @@ public final class ColumnDefinition
     private final Identifier name;
     private final String type;
     private final Optional<String> comment;
+    private final Optional<String> extend;
 
-    public ColumnDefinition(NodeLocation location, Identifier name, String type, Optional<String> comment)
+    public ColumnDefinition(NodeLocation location, Identifier name, String type, Optional<String> extend, Optional<String> comment)
     {
-        this(Optional.of(location), name, type, comment);
+        this(Optional.of(location), name, type, extend, comment);
     }
 
-    private ColumnDefinition(Optional<NodeLocation> location, Identifier name, String type, Optional<String> comment)
+    private ColumnDefinition(Optional<NodeLocation> location, Identifier name, String type, Optional<String> extend, Optional<String> comment)
     {
         super(location);
         this.name = requireNonNull(name, "name is null");
         this.type = requireNonNull(type, "type is null");
+        this.extend = requireNonNull(extend, "extend is null");
         this.comment = requireNonNull(comment, "comment is null");
     }
 
@@ -59,10 +61,15 @@ public final class ColumnDefinition
         return comment;
     }
 
+    public Optional<String> getExtend()
+    {
+        return extend;
+    }
+
     @Override
     public List<Node> getChildren()
     {
-        return ImmutableList.of(name);
+        return MutableList.of(name);
     }
 
     @Override
@@ -77,13 +84,14 @@ public final class ColumnDefinition
         ColumnDefinition o = (ColumnDefinition) obj;
         return Objects.equals(this.name, o.name) &&
                 Objects.equals(this.type, o.type) &&
+                Objects.equals(this.extend, o.extend) &&
                 Objects.equals(this.comment, o.comment);
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hash(name, type, comment);
+        return Objects.hash(name, type, extend, comment);
     }
 
     @Override
@@ -92,6 +100,7 @@ public final class ColumnDefinition
         return toStringHelper(this)
                 .add("name", name)
                 .add("type", type)
+                .add("extend", extend)
                 .add("comment", comment)
                 .toString();
     }

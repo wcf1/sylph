@@ -16,35 +16,30 @@
 package ideal.sylph.runner.flink.yarn;
 
 import com.github.harbby.gadtry.ioc.Autowired;
-import ideal.sylph.runner.flink.FlinkJobConfig;
-import ideal.sylph.runner.flink.FlinkJobHandle;
-import ideal.sylph.runner.flink.FlinkRunner;
-import ideal.sylph.runner.flink.actuator.JobParameter;
 import ideal.sylph.spi.job.Job;
-import org.apache.flink.api.common.JobID;
-import org.apache.flink.client.deployment.ClusterSpecification;
 import org.apache.flink.client.program.ClusterClient;
-import org.apache.flink.runtime.clusterframework.messages.ShutdownClusterAfterJob;
+import org.apache.flink.configuration.ConfigConstants;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.GlobalConfiguration;
 import org.apache.flink.runtime.jobgraph.JobGraph;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
+import org.apache.flink.yarn.configuration.YarnConfigOptions;
+import org.apache.flink.yarn.configuration.YarnLogConfigUtil;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.client.api.YarnClient;
+import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import scala.concurrent.Await;
-import scala.concurrent.Future;
-import scala.concurrent.duration.FiniteDuration;
 
 import java.io.File;
-import java.io.IOException;
 import java.net.URI;
 import java.net.URL;
+import java.util.Arrays;
 import java.util.Collection;
-import java.util.Objects;
-import java.util.concurrent.TimeUnit;
+import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
+import static ideal.sylph.runner.flink.FlinkRunner.FLINK_DIST;
 import static java.util.Objects.requireNonNull;
 
 /**
@@ -53,12 +48,11 @@ import static java.util.Objects.requireNonNull;
 public class FlinkYarnJobLauncher
 {
     private static final Logger logger = LoggerFactory.getLogger(FlinkYarnJobLauncher.class);
-    private static final FiniteDuration AKKA_TIMEOUT = new FiniteDuration(1, TimeUnit.MINUTES);
 
     @Autowired
-    private YarnClusterConfiguration clusterConf;
-    @Autowired
     private YarnClient yarnClient;
+    @Autowired
+    YarnConfiguration yarnConfiguration;
 
     public YarnClient getYarnClient()
     {
@@ -68,93 +62,67 @@ public class FlinkYarnJobLauncher
     public ApplicationId start(Job job)
             throws Exception
     {
-        FlinkJobHandle jobHandle = (FlinkJobHandle) job.getJobHandle();
-        JobParameter jobConfig = ((FlinkJobConfig) job.getConfig()).getConfig();
+        JobGraph jobGraph = job.getJobDAG();
+        List<File> userProvidedJars = getUserAdditionalJars(job.getDepends());
+        final Configuration flinkConfiguration = GlobalConfiguration.loadConfiguration();
 
-        Iterable<Path> userProvidedJars = getUserAdditionalJars(job.getDepends());
-        final YarnClusterDescriptor descriptor = new YarnClusterDescriptor(
-                clusterConf,
-                yarnClient,
-                jobConfig,
-                job.getId(),
-                userProvidedJars);
-        JobGraph jobGraph = jobHandle.getJobGraph();
-        //todo: How to use `savepoints` to restore a job
-        //jobGraph.setSavepointRestoreSettings(SavepointRestoreSettings.forPath("hdfs:///tmp/sylph/apps/savepoints"));
-        return start(descriptor, jobGraph).getClusterId();
-    }
-
-    private ClusterClient<ApplicationId> start(YarnClusterDescriptor descriptor, JobGraph job)
-            throws Exception
-    {
-        ApplicationId applicationId = null;
-        try {
-            ClusterClient<ApplicationId> client = descriptor.deploy();  //create app master
-            applicationId = client.getClusterId();
-            ClusterSpecification specification = new ClusterSpecification.ClusterSpecificationBuilder()
-                    .setMasterMemoryMB(1024)
-                    .setNumberTaskManagers(2)
-                    .setSlotsPerTaskManager(2)
-                    .setTaskManagerMemoryMB(1024)
-                    .createClusterSpecification();
-            client.runDetached(job, null);  //submit graph to yarn appMaster 并运行分离
-            stopAfterJob(client, job.getJobID());
-            return client;
+        String flinkHome = requireNonNull(System.getenv("FLINK_HOME"), "FLINK_HOME env not setting");
+        if (!new File(flinkHome).exists()) {
+            throw new IllegalArgumentException("FLINK_HOME " + flinkHome + " not exists");
         }
-        catch (Exception e) {
-            if (applicationId != null) {
-                yarnClient.killApplication(applicationId);
-            }
+        String flinkConfDirectory = System.getenv(ConfigConstants.ENV_FLINK_CONF_DIR);
+        if (flinkConfDirectory == null) {
+            flinkConfDirectory = new File(flinkHome, "conf").getPath();
+        }
+        flinkConfiguration.setString(YarnConfigOptions.FLINK_DIST_JAR, getFlinkJarFile(flinkHome).getPath());
+
+        final YarnJobDescriptor descriptor = new YarnJobDescriptor(
+                flinkConfiguration,
+                yarnClient,
+                yarnConfiguration,
+                job.getConfig(),
+                job.getName());
+        descriptor.addShipFiles(userProvidedJars);
+
+        YarnLogConfigUtil.setLogConfigFileInConfig(flinkConfiguration, flinkConfDirectory);
+//        List<File> logFiles = Stream.of("log4j.properties", "logback.xml")   //"conf/flink-conf.yaml"
+//                .map(x -> new File(flinkDonfDirectory, x)).collect(Collectors.toList());
+//        descriptor.addShipFiles(logFiles);
+
+        logger.info("start flink job {}", jobGraph.getJobID());
+        try (ClusterClient<ApplicationId> client = descriptor.deploy(jobGraph, true)) {
+            return client.getClusterId();
+        }
+        catch (Throwable e) {
+            logger.error("submitting job {} failed", jobGraph.getJobID(), e);
             throw e;
         }
-        finally {
-            //Clear temporary directory
-            try {
-                if (applicationId != null) {
-                    FileSystem hdfs = FileSystem.get(clusterConf.yarnConf());
-                    Path appDir = new Path(clusterConf.appRootDir(), applicationId.toString());
-                    hdfs.delete(appDir, true);
-                }
-            }
-            catch (IOException e) {
-                logger.error("clear tmp dir is fail", e);
-            }
-        }
     }
 
-    /**
-     * 如何异常挂掉了,则直接退出yarn程序
-     */
-    private void stopAfterJob(ClusterClient client, JobID jobID)
+    private static File getFlinkJarFile(String flinkHome)
     {
-        requireNonNull(jobID, "The flinkLoadJob id must not be null");
-        try {
-            Future<Object> replyFuture =
-                    client.getJobManagerGateway().ask(
-                            new ShutdownClusterAfterJob(jobID),
-                            AKKA_TIMEOUT);
-            Await.ready(replyFuture, AKKA_TIMEOUT);
-        }
-        catch (Exception e) {
-            throw new RuntimeException("Unable to tell application master to stop"
-                    + " once the specified flinkLoadJob has been finished", e);
-        }
+        String errorMessage = "error not search " + FLINK_DIST + "*.jar";
+        File[] files = requireNonNull(new File(flinkHome, "lib").listFiles(), errorMessage);
+        Optional<File> file = Arrays.stream(files)
+                .filter(f -> f.getName().startsWith(FLINK_DIST)).findFirst();
+        return file.orElseThrow(() -> new IllegalArgumentException(errorMessage));
     }
 
-    private static Iterable<Path> getUserAdditionalJars(Collection<URL> userJars)
+    private static List<File> getUserAdditionalJars(Collection<URL> userJars)
     {
         return userJars.stream().map(jar -> {
             try {
                 final URI uri = jar.toURI();
                 final File file = new File(uri);
                 if (file.exists() && file.isFile()) {
-                    return new Path(uri);
+                    return file;
                 }
             }
             catch (Exception e) {
                 logger.warn("add user jar error with URISyntaxException {}", jar);
             }
             return null;
-        }).filter(x -> Objects.nonNull(x) && !x.getName().startsWith(FlinkRunner.FLINK_DIST)).collect(Collectors.toList());
+        }).collect(Collectors.toList());
+        //.filter(x -> Objects.nonNull(x) && !x.getName().startsWith(FlinkRunner.FLINK_DIST))
     }
 }

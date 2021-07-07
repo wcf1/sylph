@@ -15,21 +15,25 @@
  */
 package ideal.sylph.main;
 
-import com.google.common.collect.ImmutableList;
-import com.google.inject.Injector;
-import com.google.inject.Module;
+import ch.qos.logback.classic.LoggerContext;
+import ch.qos.logback.classic.joran.JoranConfigurator;
+import ch.qos.logback.core.joran.spi.JoranException;
+import ch.qos.logback.core.util.StatusPrinter;
+import com.github.harbby.gadtry.GadTry;
+import com.github.harbby.gadtry.ioc.Bean;
+import com.github.harbby.gadtry.ioc.IocFactory;
+import ideal.sylph.controller.AuthAspect;
 import ideal.sylph.controller.ControllerApp;
-import ideal.sylph.main.bootstrap.Bootstrap;
-import ideal.sylph.main.server.RunnerLoader;
-import ideal.sylph.main.server.ServerMainModule;
+import ideal.sylph.main.server.SylphBean;
+import ideal.sylph.main.service.JobEngineManager;
 import ideal.sylph.main.service.JobManager;
-import ideal.sylph.main.service.PipelinePluginLoader;
+import ideal.sylph.main.service.OperatorLoader;
+import ideal.sylph.main.util.PropertiesUtil;
 import ideal.sylph.spi.job.JobStore;
-import org.apache.log4j.PropertyConfigurator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.List;
+import java.io.File;
 
 import static java.util.Objects.requireNonNull;
 
@@ -45,27 +49,32 @@ public final class SylphMaster
             " |( | ) _\\__ \\ / /_/ / / / / /_/ / / / / /   ) ) ) ) |\n" +
             " | \\|/ /____/  \\__, / /_/ / .___/ /_/ /_/   / / / /  |\n" +
             " |  '         /____/     /_/               /_/_/_/   |\n" +
-            " |  :: Sylph ::  version = (v0.4.0-SNAPSHOT)         |\n" +
+            " |  :: Sylph ::  version = (v0.6.0-SNAPSHOT)         |\n" +
             " *---------------------------------------------------*";
 
     public static void main(String[] args)
+            throws Exception
     {
-        PropertyConfigurator.configure(requireNonNull(System.getProperty("log4j.file"), "log4j.file not setting"));
-        List<Module> modules = ImmutableList.of(new ServerMainModule());
+        //PropertyConfigurator.configure(requireNonNull(System.getProperty("log4j.file"), "log4j.file not setting"));
+        loadConfig(requireNonNull(System.getProperty("logging.config"), "logback not setting"));
+        String configFile = System.getProperty("config");
+        Bean sylphBean = new SylphBean(PropertiesUtil.loadProperties(new File(configFile)));
 
-        /*2 Initialize Guice Injector */
+        /*2 Initialize GadTry Injector */
         try {
-            Injector injector = new Bootstrap(modules)
-                    .name(SylphMaster.class.getSimpleName())
-                    .strictConfig()
-                    .requireExplicitBindings(false)
-                    .initialize();
-            injector.getInstance(PipelinePluginLoader.class).loadPlugins();
-            injector.getInstance(RunnerLoader.class).loadPlugins();
-            injector.getInstance(JobStore.class).loadJobs();
+            logger.info("========={} Bootstrap initialize...========", SylphMaster.class.getCanonicalName());
+            IocFactory app = GadTry.create(sylphBean, binder ->
+                    binder.bind(ControllerApp.class).withSingle()
+            ).aop(new AuthAspect()).initialize();
+            //----analysis
+            logger.info("Analysis App dependencys {}", String.join("\n", app.analysis().printShow()));
 
-            injector.getInstance(JobManager.class).start();
-            injector.getInstance(ControllerApp.class).start();
+            app.getInstance(OperatorLoader.class).loadPlugins();
+            app.getInstance(JobEngineManager.class).loadRunners();
+            app.getInstance(JobStore.class).loadJobs();
+
+            app.getInstance(JobManager.class).start();
+            app.getInstance(ControllerApp.class).start();
             //ProcessHandle.current().pid()
             logger.info("\n" + logo);
             logger.info("======== SERVER STARTED this pid is {}========");
@@ -74,5 +83,19 @@ public final class SylphMaster
             logger.error("SERVER START FAILED...", e);
             System.exit(1);
         }
+    }
+
+    /**
+     * 加载外部的logback配置文件
+     */
+    private static void loadConfig(String logbackXml)
+            throws JoranException
+    {
+        LoggerContext lc = (LoggerContext) LoggerFactory.getILoggerFactory();
+        JoranConfigurator configurator = new JoranConfigurator();
+        configurator.setContext(lc);
+        lc.reset();
+        configurator.doConfigure(logbackXml);
+        StatusPrinter.printInCaseOfErrorsOrWarnings(lc);
     }
 }

@@ -15,7 +15,8 @@
  */
 package ideal.sylph.parser.antlr;
 
-import com.google.common.collect.ImmutableList;
+import com.github.harbby.gadtry.collection.mutable.MutableList;
+import ideal.sylph.parser.antlr.tree.AllowedLateness;
 import ideal.sylph.parser.antlr.tree.BooleanLiteral;
 import ideal.sylph.parser.antlr.tree.ColumnDefinition;
 import ideal.sylph.parser.antlr.tree.CreateFunction;
@@ -35,15 +36,19 @@ import ideal.sylph.parser.antlr.tree.SelectQuery;
 import ideal.sylph.parser.antlr.tree.StringLiteral;
 import ideal.sylph.parser.antlr.tree.TableElement;
 import ideal.sylph.parser.antlr.tree.WaterMark;
+import ideal.sylph.parser.antlr.tree.WindowTrigger;
 import ideal.sylph.parser.antlr4.SqlBaseBaseVisitor;
 import ideal.sylph.parser.antlr4.SqlBaseParser;
 import org.antlr.v4.runtime.ParserRuleContext;
 import org.antlr.v4.runtime.Token;
 import org.antlr.v4.runtime.misc.Interval;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static java.util.Objects.requireNonNull;
 import static java.util.stream.Collectors.toList;
@@ -54,7 +59,11 @@ public class AstBuilder
     @Override
     public Node visitProperty(SqlBaseParser.PropertyContext context)
     {
-        return new Property(getLocation(context), (Identifier) visit(context.identifier()), (Expression) visit(context.expression()));
+        String withKey = visit(context.qualifiedName().identifier(), Identifier.class).stream()
+                .map(Identifier::getValue)
+                .collect(Collectors.joining("."));
+
+        return new Property(getLocation(context), withKey, (Expression) visit(context.expression()));
     }
 
     @Override
@@ -153,6 +162,30 @@ public class AstBuilder
     }
 
     @Override
+    public Node visitTrigger(SqlBaseParser.TriggerContext ctx)
+    {
+        SqlBaseParser.StringContext stringContext = ctx.string();
+        if (stringContext != null) {
+            return new WindowTrigger(getLocation(ctx), visit(stringContext, StringLiteral.class).getValue());
+        }
+        else {
+            return new WindowTrigger(getLocation(ctx), ctx.value.getText());
+        }
+    }
+
+    @Override
+    public Node visitAllowedLateness(SqlBaseParser.AllowedLatenessContext ctx)
+    {
+        SqlBaseParser.StringContext stringContext = ctx.string();
+        if (stringContext != null) {
+            return new AllowedLateness(getLocation(ctx), visit(stringContext, StringLiteral.class).getValue());
+        }
+        else {
+            return new AllowedLateness(getLocation(ctx), ctx.value.getText());
+        }
+    }
+
+    @Override
     public Node visitWatermark(SqlBaseParser.WatermarkContext context)
     {
         List<Identifier> field = visit(context.identifier(), Identifier.class);
@@ -182,7 +215,7 @@ public class AstBuilder
         if (context.COMMENT() != null) {
             comment = Optional.of(((StringLiteral) visit(context.string())).getValue());
         }
-        List<Property> properties = ImmutableList.of();
+        List<Property> properties = MutableList.of();
         if (context.properties() != null) {
             properties = visit(context.properties().property(), Property.class);
         }
@@ -199,7 +232,6 @@ public class AstBuilder
         }
 
         List<TableElement> elements = visit(context.tableElement(), TableElement.class);
-
         return new CreateTable(
                 requireNonNull(type, "table type is null,but must is SOURCE or SINK or BATCH"),
                 getLocation(context),
@@ -215,16 +247,64 @@ public class AstBuilder
     @Override
     public Node visitInsertInto(SqlBaseParser.InsertIntoContext context)
     {
-        String insert = getNodeText(context);
+        QualifiedName qualifiedName = getQualifiedName(context.qualifiedName());
+        SelectQuery selectQuery = context.withQuery() == null ?
+                visit(context.queryStream(), SelectQuery.class) :
+                visit(context.withQuery(), SelectQuery.class);
 
-        return new InsertInto(getLocation(context), insert);
+        Interval interval = new Interval(context.start.getStartIndex(), selectQuery.getQueryEndIndex());
+        String insert = context.start.getInputStream().getText(interval);
+        //String insert = getNodeText(context);
+
+        return new InsertInto(getLocation(context), insert, qualifiedName, selectQuery);
+    }
+
+    @Override
+    public Node visitQueryStream(SqlBaseParser.QueryStreamContext ctx)
+    {
+        SqlBaseParser.AllowedLatenessContext allowedLatenessContext = ctx.allowedLateness();
+        SqlBaseParser.TriggerContext triggerContext = ctx.trigger();
+
+        Optional<AllowedLateness> allowedLateness = Optional.empty();
+        Optional<WindowTrigger> windowTrigger = Optional.empty();
+
+        Stream.Builder<Integer> builder = Stream.builder();
+        if (allowedLatenessContext != null) {
+            builder.add(allowedLatenessContext.start.getStartIndex() - 1);
+            allowedLateness = Optional.of(visit(allowedLatenessContext, AllowedLateness.class));
+        }
+        if (triggerContext != null) {
+            builder.add(triggerContext.start.getStartIndex() - 1);
+            windowTrigger = Optional.of(visit(triggerContext, WindowTrigger.class));
+        }
+
+        int queryEnd = builder.build().reduce((x, y) -> x < y ? x : y).orElse(ctx.stop.getStopIndex());
+        Interval interval = new Interval(ctx.start.getStartIndex(), queryEnd);
+        String query = ctx.start.getInputStream().getText(interval);
+
+        //String fullQuery = getNodeText(context);
+        return new SelectQuery(getLocation(ctx), query, queryEnd, allowedLateness, windowTrigger);
     }
 
     @Override
     public Node visitSelectQuery(SqlBaseParser.SelectQueryContext context)
     {
-        String query = getNodeText(context);
-        return new SelectQuery(getLocation(context), query);
+        return visit(context.queryStream(), SelectQuery.class);
+    }
+
+    @Override
+    public Node visitWithQuery(SqlBaseParser.WithQueryContext ctx)
+    {
+        Map<Identifier, SelectQuery> withTableQuery = new LinkedHashMap<>();
+        for (SqlBaseParser.AsQueryContext asQueryContext : ctx.asQuery()) {
+            SelectQuery selectQuery = visit(asQueryContext.queryStream(), SelectQuery.class);
+            Identifier identifier = visit(asQueryContext.identifier(), Identifier.class);
+            withTableQuery.put(identifier, selectQuery);
+        }
+        SelectQuery selectQuery = visit(ctx.queryStream(), SelectQuery.class);
+        selectQuery.setWithTableQuery(withTableQuery);
+
+        return selectQuery;
     }
 
     private static String getNodeText(ParserRuleContext context)
@@ -237,16 +317,28 @@ public class AstBuilder
     }
 
     @Override
+    public Node visitExtend(SqlBaseParser.ExtendContext context)
+    {
+        return visit(context.string());
+    }
+
+    @Override
     public Node visitColumnDefinition(SqlBaseParser.ColumnDefinitionContext context)
     {
         Optional<String> comment = Optional.empty();
         if (context.COMMENT() != null) {
             comment = Optional.of(((StringLiteral) visit(context.string())).getValue());
         }
+        Optional<String> extend = Optional.empty();
+        if (context.extend() != null) {
+            extend = Optional.of(((StringLiteral) visit(context.extend())).getValue());
+        }
+
         return new ColumnDefinition(
                 getLocation(context),
                 (Identifier) visit(context.identifier()),
                 getType(context.type()),
+                extend,
                 comment);
     }
 

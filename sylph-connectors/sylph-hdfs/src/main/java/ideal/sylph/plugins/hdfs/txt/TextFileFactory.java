@@ -15,27 +15,31 @@
  */
 package ideal.sylph.plugins.hdfs.txt;
 
-import ideal.sylph.etl.Row;
+import ideal.sylph.etl.Record;
+import ideal.sylph.etl.Schema;
+import ideal.sylph.plugins.hdfs.HdfsSink;
 import ideal.sylph.plugins.hdfs.parquet.HDFSFactory;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.compress.CompressionCodec;
+import org.apache.hadoop.io.compress.Lz4Codec;
+import org.apache.hadoop.util.ReflectionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Supplier;
 
+import static com.github.harbby.gadtry.base.MoreObjects.checkState;
+import static com.github.harbby.gadtry.base.Throwables.throwsException;
 import static ideal.sylph.plugins.hdfs.factory.HDFSFactorys.getRowKey;
 import static java.util.Objects.requireNonNull;
 
@@ -46,26 +50,55 @@ public class TextFileFactory
         implements HDFSFactory
 {
     private static final Logger logger = LoggerFactory.getLogger(TextFileFactory.class);
-    private final Map<String, FSDataOutputStream> writerManager = new HashCache();
-    private final BlockingQueue<Tuple2<String, Long>> streamData = new LinkedBlockingQueue<>(1000);
-    private final ExecutorService executorPool = Executors.newSingleThreadExecutor();
+    private final Map<String, FileChannel> writerManager = new HashCache();
+    private final Set<String> needClose = new HashSet<>();
 
     private final String writeTableDir;
     private final String table;
-    private final Row.Schema schema;
 
-    private volatile boolean closed = false;
+    private final long partition;
+    private final int batchSize;
+    private final long fileSplitSize;
+    private final int maxCloseMinute;           //文件创建多久就关闭
 
-    public TextFileFactory(
-            final String writeTableDir,
-            final String table,
-            final Row.Schema schema)
+    public TextFileFactory(String table, Schema schema,
+            HdfsSink.HdfsSinkConfig config,
+            long partition)
     {
-        requireNonNull(writeTableDir, "writeTableDir is null");
-        this.writeTableDir = writeTableDir.endsWith("/") ? writeTableDir : writeTableDir + "/";
-
-        this.schema = requireNonNull(schema, "schema is null");
+        this.partition = partition;
+        this.writeTableDir = config.getWriteDir().endsWith("/") ? config.getWriteDir() : config.getWriteDir() + "/";
         this.table = requireNonNull(table, "table is null");
+        this.batchSize = (int) config.getBatchBufferSize() * 1024 * 1024;
+        this.fileSplitSize = config.getFileSplitSize() * 1024L * 1024L * 8L;
+        checkState(config.getMaxCloseMinute() >= 5, "maxCloseMinute must > 5Minute");
+        this.maxCloseMinute = ((int) config.getMaxCloseMinute()) * 60_000;
+
+        //todo: Increase time-division functionality
+        new Thread(() -> {
+            Thread.currentThread().setName("TextFileFactory_TimeChecker");
+            while (true) {
+                try {
+                    synchronized (needClose) {
+                        final long thisSystemTime = System.currentTimeMillis();
+                        writerManager.forEach((key, writer) -> {
+                            boolean isClose = (thisSystemTime - writer.getCreateTime()) > maxCloseMinute;
+                            if (isClose) {
+                                needClose.add(key);
+                            }
+                        });
+                    }
+
+                    TimeUnit.SECONDS.sleep(1);
+                }
+                catch (InterruptedException e) {
+                    break;
+                }
+                catch (Exception e) {
+                    logger.error("check Thread error:", e);
+                }
+            }
+        }).start();
+
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             writerManager.entrySet().stream().parallel().forEach(x -> {
                 String rowKey = x.getKey();
@@ -77,58 +110,63 @@ public class TextFileFactory
                 }
             });
         }));
-
-        executorPool.submit(() -> {
-            Thread.currentThread().setName("Text_Factory_Consumer");
-            while (!closed) {
-                Tuple2<String, Long> tuple2 = streamData.poll();
-                if (tuple2 != null) {
-                    long eventTime = tuple2.f2();
-                    String value = tuple2.f1();
-                    FSDataOutputStream outputStream = getTxtFileWriter(eventTime);
-                    writeString(outputStream, value);
-                }
-                else {
-                    TimeUnit.MILLISECONDS.sleep(1);
-                }
-            }
-            return null;
-        });
     }
 
-    private FSDataOutputStream getTxtFileWriter(long eventTime)
+    private FileChannel getTxtFileWriter(long eventTime)
+            throws IOException
     {
+        if (!needClose.isEmpty()) {
+            synchronized (needClose) {
+                for (String rowKey : needClose) {
+                    FileChannel writer = writerManager.remove(rowKey);
+                    if (writer != null) {
+                        writer.close();
+                        logger.info("close >MaxFileMinute[{}] textFile: {}, size:{}, createTime {}", maxCloseMinute, writer.getFilePath(), writer.getWriteSize(), writer.getCreateTime());
+                    }
+                }
+                needClose.clear();
+            }
+        }
+
+        //---------------------------------
         TextTimeParser timeParser = new TextTimeParser(eventTime);
-        String rowKey = getRowKey(table, timeParser);
-
-        return getTxtFileWriter(rowKey, () -> {
-            try {
-                FileSystem hdfs = FileSystem.get(new Configuration());
-                //CompressionCodec codec = ReflectionUtils.newInstance(GzipCodec.class, hdfs.getConf());
-                String outputPath = writeTableDir + timeParser.getPartionPath();
-                logger.info("create text file {}", outputPath);
-                Path path = new Path(outputPath);
-                FSDataOutputStream outputStream = hdfs.exists(path) ? hdfs.append(path) : hdfs.create(path, false);
-                //return codec.createOutputStream(outputStream);
-                return outputStream;
+        String rowKey = getRowKey(this.table, timeParser) + "\u0001" + this.partition;
+        FileChannel writer = this.writerManager.get(rowKey);
+        if (writer == null) {
+            synchronized (needClose) {  //Cannot traverse check when putting
+                FileChannel fileChannel = this.createOutputStream(rowKey, timeParser, 0L);
+                this.writerManager.put(rowKey, fileChannel);
+                return fileChannel;
             }
-            catch (IOException e) {
-                throw new RuntimeException("textFile writer create failed", e);
+        }
+        else if (writer.getWriteSize() > this.fileSplitSize) {
+            synchronized (needClose) {  //Cannot traverse check when deleting
+                writerManager.remove(rowKey);
+                writer.close();
+                logger.info("close >MaxSplitSize[{}] textFile: {}, size:{}, createTime {}", fileSplitSize, writer.getFilePath(), writer.getWriteSize(), writer.getCreateTime());
+                long split = writer.getSplit() + 1L;
+                FileChannel fileChannel = this.createOutputStream(rowKey, timeParser, split);
+                this.writerManager.put(rowKey, fileChannel);
+                return fileChannel;
             }
-        });
-    }
-
-    private FSDataOutputStream getTxtFileWriter(String rowKey, Supplier<FSDataOutputStream> builder)
-    {
-        //2,检查流是否存在 不存在就新建立一个
-        FSDataOutputStream writer = writerManager.get(rowKey);
-        if (writer != null) {
-            return writer;
         }
         else {
-            synchronized (writerManager) {
-                return writerManager.computeIfAbsent(rowKey, (key) -> builder.get());
-            }
+            return writer;
+        }
+    }
+
+    private FileChannel createOutputStream(String rowKey, TextTimeParser timeParser, long split)
+    {
+        Configuration hadoopConf = new Configuration();
+        CompressionCodec codec = ReflectionUtils.newInstance(Lz4Codec.class, hadoopConf);
+        String outputPath = this.writeTableDir + timeParser.getPartitionPath() + "_partition_" + this.partition + "_split" + split + codec.getDefaultExtension();
+        logger.info("create {} text file {}", rowKey, outputPath);
+        try {
+            FileChannel fileChannel = new FileChannel(outputPath, split, codec, hadoopConf);
+            return fileChannel;
+        }
+        catch (IOException var11) {
+            throw new RuntimeException("textFile " + outputPath + " writer create failed", var11);
         }
     }
 
@@ -142,93 +180,129 @@ public class TextFileFactory
     public void writeLine(long eventTime, Map<String, Object> evalRow)
             throws IOException
     {
-        throw new UnsupportedOperationException("this method have't support!");
+        this.writeLine(eventTime, evalRow.values());
     }
 
     @Override
-    public void writeLine(long eventTime, List<Object> evalRow)
+    public void writeLine(long eventTime, Collection<Object> evalRow)
             throws IOException
     {
         StringBuilder builder = new StringBuilder();
-        for (int i = 0; i < evalRow.size(); i++) {
-            Object value = evalRow.get(i);
+        int i = 0;
+        for (Object value : evalRow) {
             if (i != 0) {
                 builder.append("\u0001");
             }
             if (value != null) {
                 builder.append(value.toString());
             }
+            i++;
         }
-        try {
-            streamData.put(Tuple2.of(builder.toString(), eventTime));
-        }
-        catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+
+        String value = builder.toString();
+        this.writeLine(eventTime, value);
     }
 
     @Override
-    public void writeLine(long eventTime, Row row)
+    public void writeLine(long eventTime, Record record)
             throws IOException
     {
-        try {
-            streamData.put(Tuple2.of(row.mkString("\u0001"), eventTime));
-        }
-        catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        String value = record.mkString("\u0001");
+        this.writeLine(eventTime, value);
     }
 
-    private static void writeString(FSDataOutputStream outputStream, String string)
+    private void writeLine(long eventTime, String value)
             throws IOException
     {
-        byte[] bytes = (string + "\n").getBytes(StandardCharsets.UTF_8); //先写入换行符
-        outputStream.write(bytes); //经过测试 似乎是线程安全的
-        int batchSize = 1024; //1k = 1024*1
-        if (outputStream.size() % batchSize == 0) {
-            outputStream.flush();
-        }
+        TextFileFactory.FileChannel writer = this.getTxtFileWriter(eventTime);
+        byte[] bytes = (value + "\n").getBytes(StandardCharsets.UTF_8);
+        writer.write(bytes);
     }
 
     @Override
     public void close()
             throws IOException
     {
+        this.writerManager.forEach((k, v) -> {
+            try {
+                v.close();
+            }
+            catch (IOException var3) {
+                logger.error("close {}", k, var3);
+            }
+        });
     }
 
-    public static class Tuple2<T1, T2>
+    private class FileChannel
     {
-        private final T1 t1;
-        private final T2 t2;
+        private final long createTime = System.currentTimeMillis();
+        private final FileSystem hdfs;
+        private final String filePath;
+        private final OutputStream outputStream;
 
-        public Tuple2(T1 t1, T2 t2)
+        private long writeSize = 0L;
+        private long bufferSize;
+        private final long split;
+
+        public FileChannel(String outputPath, long split, CompressionCodec codec, Configuration hadoopConf)
+                throws IOException
         {
-            this.t1 = t1;
-            this.t2 = t2;
+            Path path = new Path(outputPath);
+            this.hdfs = path.getFileSystem(hadoopConf);
+            OutputStream outputStream = hdfs.exists(path) ? hdfs.append(path) : hdfs.create(path, false);
+
+            this.filePath = outputPath;
+            this.split = split;
+            this.outputStream = codec.createOutputStream(outputStream);
         }
 
-        public static <T1, T2> Tuple2<T1, T2> of(T1 t1, T2 t2)
+        private void write(byte[] bytes)
+                throws IOException
         {
-            return new Tuple2<>(t1, t2);
+            outputStream.write(bytes);
+            bufferSize += bytes.length;
+            this.writeSize += bytes.length;
+
+            if (bufferSize > batchSize) {
+                this.outputStream.flush();
+                this.bufferSize = 0L;
+            }
         }
 
-        public T1 f1()
+        public String getFilePath()
         {
-            return t1;
+            return filePath;
         }
 
-        public T2 f2()
+        public long getCreateTime()
         {
-            return t2;
+            return createTime;
+        }
+
+        public long getWriteSize()
+        {
+            return writeSize;
+        }
+
+        public long getSplit()
+        {
+            return split;
+        }
+
+        public void close()
+                throws IOException
+        {
+            outputStream.close();
+            hdfs.rename(new Path(filePath), new Path(filePath.replace("_tmp_", "text_")));
         }
     }
 
     // An LRU cache using a linked hash map
     private static class HashCache
-            extends LinkedHashMap<String, FSDataOutputStream>
+            extends LinkedHashMap<String, FileChannel>
     {
-        private static final int CACHE_SIZE = 64;
-        private static final int INIT_SIZE = 32;
+        private static final int CACHE_SIZE = 1024;
+        private static final int INIT_SIZE = 64;
         private static final float LOAD_FACTOR = 0.6f;
 
         HashCache()
@@ -239,7 +313,7 @@ public class TextFileFactory
         private static final long serialVersionUID = 1;
 
         @Override
-        protected boolean removeEldestEntry(Map.Entry<String, FSDataOutputStream> eldest)
+        protected boolean removeEldestEntry(Map.Entry<String, FileChannel> eldest)
         {
             if (size() > CACHE_SIZE) {
                 try {
@@ -248,7 +322,7 @@ public class TextFileFactory
                     return true;
                 }
                 catch (IOException e) {
-                    throw new RuntimeException(e);
+                    throw throwsException(e);
                 }
             }
             else {
